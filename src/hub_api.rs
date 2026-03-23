@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
-use tracing::info;
+use tracing::{info, warn};
 use xet_client::cas_client::auth::{AuthError, TokenInfo, TokenRefresher};
 
 use crate::error::{Error, Result};
@@ -306,17 +306,17 @@ impl HubApiClient {
                 let url = format!("{}/api/{}/{}", endpoint, repo_type.api_prefix(), repo_id);
                 let resp = auth(client.get(&url)).send().await?;
                 if !resp.status().is_success() {
-                    return Err(Error::Hub(format!(
-                        "Failed to resolve repo {}: {} {}",
-                        repo_id,
-                        resp.status(),
-                        resp.text().await.unwrap_or_default()
-                    )));
+                    let status = resp.status().as_u16();
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(Error::hub_status(
+                        status,
+                        format!("failed to resolve repo {repo_id}: {status} {body}"),
+                    ));
                 }
                 let body: serde_json::Value = resp.json().await?;
                 let resolved_id = body["id"]
                     .as_str()
-                    .ok_or_else(|| Error::Hub("repo info missing 'id' field".to_string()))?;
+                    .ok_or_else(|| Error::hub("repo info missing 'id' field"))?;
                 if resolved_id != repo_id {
                     info!("Resolved repo alias: {} → {}", repo_id, resolved_id);
                 }
@@ -334,11 +334,8 @@ impl HubApiClient {
                 let url = format!("{}/api/buckets/{}", endpoint, bucket_id);
                 let resp = auth(client.get(&url)).send().await?;
                 if !resp.status().is_success() {
-                    return Err(Error::Hub(format!(
-                        "Bucket not found: {} ({})",
-                        bucket_id,
-                        resp.status(),
-                    )));
+                    let status = resp.status().as_u16();
+                    return Err(Error::hub_status(status, format!("bucket not found: {bucket_id}")));
                 }
                 let body: serde_json::Value = resp.json().await?;
                 let last_modified = body["updatedAt"].as_str().map(mtime_from_str).unwrap_or(UNIX_EPOCH);
@@ -407,6 +404,49 @@ impl HubApiClient {
         }
     }
 
+    /// Send an HTTP request with automatic retry on transient errors (429, 5xx, timeouts).
+    /// Retries up to 2 times with exponential backoff (500ms, 1s).
+    async fn send_with_retry(
+        &self,
+        build_request: impl Fn() -> reqwest::RequestBuilder,
+        context: &str,
+    ) -> Result<reqwest::Response> {
+        const MAX_RETRIES: u32 = 2;
+        let mut attempt = 0;
+        loop {
+            let result = build_request().send().await;
+            match result {
+                Ok(resp) if resp.status().is_success() || resp.status().is_redirection() => {
+                    return Ok(resp);
+                }
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    let body = resp.text().await.unwrap_or_default();
+                    let err = Error::hub_status(status, format!("{context}: {status} {body}"));
+                    if err.is_retryable() && attempt < MAX_RETRIES {
+                        attempt += 1;
+                        let delay = std::time::Duration::from_millis(500 * 2u64.pow(attempt - 1));
+                        warn!("{context}: transient error ({status}), retry {attempt}/{MAX_RETRIES} in {delay:?}");
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    return Err(err);
+                }
+                Err(err) => {
+                    let err = Error::Http(err);
+                    if err.is_retryable() && attempt < MAX_RETRIES {
+                        attempt += 1;
+                        let delay = std::time::Duration::from_millis(500 * 2u64.pow(attempt - 1));
+                        warn!("{context}: transient error, retry {attempt}/{MAX_RETRIES} in {delay:?}: {err}");
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
+        }
+    }
+
     pub fn source(&self) -> &SourceKind {
         &self.source
     }
@@ -457,14 +497,14 @@ impl HubApiClient {
             return Ok(());
         }
         let entries = self.list_tree("", false).await.map_err(|e| {
-            Error::Hub(format!(
-                "Subfolder '{}' not found in {}: {e}",
-                self.path_prefix, self.source,
+            Error::hub(format!(
+                "subfolder '{}' not found in {}: {e}",
+                self.path_prefix, self.source
             ))
         })?;
         if entries.is_empty() {
-            return Err(Error::Hub(format!(
-                "Subfolder '{}' is empty or does not exist in {}",
+            return Err(Error::hub(format!(
+                "subfolder '{}' is empty or does not exist in {}",
                 self.path_prefix, self.source,
             )));
         }
@@ -513,15 +553,9 @@ impl HubApiClient {
         };
 
         loop {
-            let resp = self.auth(self.client.get(&url)).send().await?;
-
-            if !resp.status().is_success() {
-                return Err(Error::Hub(format!(
-                    "tree listing failed: {} {}",
-                    resp.status(),
-                    resp.text().await.unwrap_or_default()
-                )));
-            }
+            let resp = self
+                .send_with_retry(|| self.auth(self.client.get(&url)), "tree listing")
+                .await?;
 
             let next_url = resp
                 .headers()
@@ -575,15 +609,9 @@ impl HubApiClient {
         };
 
         loop {
-            let resp = self.auth(self.client.get(&url)).send().await?;
-
-            if !resp.status().is_success() {
-                return Err(Error::Hub(format!(
-                    "repo tree listing failed: {} {}",
-                    resp.status(),
-                    resp.text().await.unwrap_or_default()
-                )));
-            }
+            let resp = self
+                .send_with_retry(|| self.auth(self.client.get(&url)), "repo tree listing")
+                .await?;
 
             let next_url = resp
                 .headers()
@@ -645,14 +673,14 @@ impl HubApiClient {
                 )
             }
         };
-        let resp = self.auth(self.head_client.head(&url)).send().await?;
-
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        if !resp.status().is_success() && !resp.status().is_redirection() {
-            return Err(Error::Hub(format!("head_file failed: {}", resp.status())));
-        }
+        let resp = self
+            .send_with_retry(|| self.auth(self.head_client.head(&url)), "head_file")
+            .await;
+        let resp = match resp {
+            Ok(r) => r,
+            Err(Error::Hub { status: Some(404), .. }) => return Ok(None),
+            Err(err) => return Err(err),
+        };
 
         let headers = resp.headers();
         let xet_hash = headers
@@ -702,16 +730,9 @@ impl HubApiClient {
             }
         };
 
-        let resp = self.auth(self.client.get(&url)).send().await?;
-
-        if !resp.status().is_success() {
-            return Err(Error::Hub(format!(
-                "CAS token request failed: {} {}",
-                resp.status(),
-                resp.text().await.unwrap_or_default()
-            )));
-        }
-
+        let resp = self
+            .send_with_retry(|| self.auth(self.client.get(&url)), "CAS token request")
+            .await?;
         let info: CasTokenInfo = resp.json().await?;
         Ok(info)
     }
@@ -721,21 +742,14 @@ impl HubApiClient {
         let bucket_id = match &self.source {
             SourceKind::Bucket { bucket_id } => bucket_id,
             SourceKind::Repo { .. } => {
-                return Err(Error::Hub("write tokens not supported for repos".to_string()));
+                return Err(Error::hub("write tokens not supported for repos"));
             }
         };
         let url = format!("{}/api/buckets/{}/xet-write-token", self.endpoint, bucket_id);
 
-        let resp = self.auth(self.client.get(&url)).send().await?;
-
-        if !resp.status().is_success() {
-            return Err(Error::Hub(format!(
-                "CAS write token request failed: {} {}",
-                resp.status(),
-                resp.text().await.unwrap_or_default()
-            )));
-        }
-
+        let resp = self
+            .send_with_retry(|| self.auth(self.client.get(&url)), "CAS write token request")
+            .await?;
         let info: CasTokenInfo = resp.json().await?;
         Ok(info)
     }
@@ -745,7 +759,7 @@ impl HubApiClient {
         let bucket_id = match &self.source {
             SourceKind::Bucket { bucket_id } => bucket_id,
             SourceKind::Repo { .. } => {
-                return Err(Error::Hub("batch operations not supported for repos".to_string()));
+                return Err(Error::hub("batch operations not supported for repos"));
             }
         };
         let url = format!("{}/api/buckets/{}/batch", self.endpoint, bucket_id);
@@ -777,20 +791,15 @@ impl HubApiClient {
             body.push('\n');
         }
 
-        let resp = self
-            .auth(self.client.post(&url))
-            .header("content-type", "application/x-ndjson")
-            .body(body)
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            return Err(Error::Hub(format!(
-                "batch operation failed: {} {}",
-                resp.status(),
-                resp.text().await.unwrap_or_default()
-            )));
-        }
+        self.send_with_retry(
+            || {
+                self.auth(self.client.post(&url))
+                    .header("content-type", "application/x-ndjson")
+                    .body(body.clone())
+            },
+            "batch operation",
+        )
+        .await?;
 
         Ok(())
     }
@@ -831,28 +840,27 @@ impl HubApiClient {
             None
         };
 
-        let mut req = self.auth(self.client.get(&url));
-        if let Some(ref etag) = cached_etag {
-            // Re-quote for RFC 7232 compliance (sidecar stores unquoted value).
-            req = req.header("If-None-Match", format!("\"{}\"", etag.trim()));
-        }
-
         info!("HTTP download: {} → {:?}", path, dest);
-        let resp = req.send().await?;
-
-        if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
-            info!("HTTP cache hit (304): {}", path);
-            return Ok(());
-        }
-
-        if !resp.status().is_success() {
-            return Err(Error::Hub(format!(
-                "HTTP download failed for {}: {} {}",
-                path,
-                resp.status(),
-                resp.text().await.unwrap_or_default()
-            )));
-        }
+        let resp = self
+            .send_with_retry(
+                || {
+                    let mut r = self.auth(self.client.get(&url));
+                    if let Some(ref etag) = cached_etag {
+                        r = r.header("If-None-Match", format!("\"{}\"", etag.trim()));
+                    }
+                    r
+                },
+                "HTTP download",
+            )
+            .await;
+        let resp = match resp {
+            Ok(r) if r.status() == reqwest::StatusCode::NOT_MODIFIED => {
+                info!("HTTP cache hit (304): {}", path);
+                return Ok(());
+            }
+            Ok(r) => r,
+            Err(err) => return Err(err),
+        };
 
         let new_etag = resp
             .headers()
