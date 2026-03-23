@@ -199,6 +199,13 @@ fn retry_delay(attempt: u32) -> std::time::Duration {
     std::time::Duration::from_millis(500 * 2u64.pow(attempt - 1))
 }
 
+/// Parse `Retry-After` header (seconds) from an HTTP response, capped at 30s.
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
+    let value = headers.get("retry-after")?.to_str().ok()?;
+    let secs: u64 = value.parse().ok()?;
+    Some(std::time::Duration::from_secs(secs.min(30)))
+}
+
 pub struct HubApiClient {
     client: Client,
     /// Client that does NOT follow redirects — used for HEAD requests where we
@@ -413,7 +420,7 @@ impl HubApiClient {
     }
 
     /// Send an HTTP request with automatic retry on transient errors (429, 5xx, timeouts).
-    /// Retries up to 2 times with exponential backoff (500ms, 1s).
+    /// Honors `Retry-After` headers when present, falls back to exponential backoff.
     async fn send_with_retry(
         &self,
         build_request: impl Fn() -> reqwest::RequestBuilder,
@@ -432,7 +439,7 @@ impl HubApiClient {
                     // Skip reading body on retryable errors to avoid wasting I/O.
                     if is_retryable_status(status) && attempt < MAX_RETRIES {
                         attempt += 1;
-                        let delay = retry_delay(attempt);
+                        let delay = parse_retry_after(resp.headers()).unwrap_or_else(|| retry_delay(attempt));
                         warn!("{context}: transient error ({status}), retry {attempt}/{MAX_RETRIES} in {delay:?}");
                         tokio::time::sleep(delay).await;
                         continue;
