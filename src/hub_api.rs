@@ -191,6 +191,14 @@ pub struct CasTokenInfo {
 /// How often the token file is re-read from disk.
 const TOKEN_FILE_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
 
+fn is_retryable_status(status: u16) -> bool {
+    matches!(status, 429 | 500 | 502 | 503 | 504)
+}
+
+fn retry_delay(attempt: u32) -> std::time::Duration {
+    std::time::Duration::from_millis(500 * 2u64.pow(attempt - 1))
+}
+
 pub struct HubApiClient {
     client: Client,
     /// Client that does NOT follow redirects — used for HEAD requests where we
@@ -415,35 +423,33 @@ impl HubApiClient {
         let mut attempt = 0;
         loop {
             let result = build_request().send().await;
-            match result {
+            let err = match result {
                 Ok(resp) if resp.status().is_success() || resp.status().is_redirection() => {
                     return Ok(resp);
                 }
                 Ok(resp) => {
                     let status = resp.status().as_u16();
-                    let body = resp.text().await.unwrap_or_default();
-                    let err = Error::hub_status(status, format!("{context}: {status} {body}"));
-                    if err.is_retryable() && attempt < MAX_RETRIES {
+                    // Skip reading body on retryable errors to avoid wasting I/O.
+                    if is_retryable_status(status) && attempt < MAX_RETRIES {
                         attempt += 1;
-                        let delay = std::time::Duration::from_millis(500 * 2u64.pow(attempt - 1));
+                        let delay = retry_delay(attempt);
                         warn!("{context}: transient error ({status}), retry {attempt}/{MAX_RETRIES} in {delay:?}");
                         tokio::time::sleep(delay).await;
                         continue;
                     }
-                    return Err(err);
+                    let body = resp.text().await.unwrap_or_default();
+                    Error::hub_status(status, format!("{context}: {status} {body}"))
                 }
-                Err(err) => {
-                    let err = Error::Http(err);
-                    if err.is_retryable() && attempt < MAX_RETRIES {
-                        attempt += 1;
-                        let delay = std::time::Duration::from_millis(500 * 2u64.pow(attempt - 1));
-                        warn!("{context}: transient error, retry {attempt}/{MAX_RETRIES} in {delay:?}: {err}");
-                        tokio::time::sleep(delay).await;
-                        continue;
-                    }
-                    return Err(err);
-                }
+                Err(err) => Error::Http(err),
+            };
+            if err.is_retryable() && attempt < MAX_RETRIES {
+                attempt += 1;
+                let delay = retry_delay(attempt);
+                warn!("{context}: transient error, retry {attempt}/{MAX_RETRIES} in {delay:?}: {err}");
+                tokio::time::sleep(delay).await;
+                continue;
             }
+            return Err(err);
         }
     }
 
@@ -791,6 +797,7 @@ impl HubApiClient {
             body.push('\n');
         }
 
+        let body = bytes::Bytes::from(body);
         self.send_with_retry(
             || {
                 self.auth(self.client.post(&url))
