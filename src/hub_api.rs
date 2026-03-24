@@ -199,11 +199,27 @@ fn retry_delay(attempt: u32) -> std::time::Duration {
     std::time::Duration::from_millis(500 * 2u64.pow(attempt - 1))
 }
 
-/// Parse `Retry-After` header (seconds) from an HTTP response, capped at 30s.
+/// Parse `Retry-After` header from an HTTP response, capped at 30s.
+/// Handles both delta-seconds (e.g., "120") and HTTP-date format (e.g., "Fri, 24 Mar 2026 12:00:00 GMT").
 fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
     let value = headers.get("retry-after")?.to_str().ok()?;
-    let secs: u64 = value.parse().ok()?;
-    Some(std::time::Duration::from_secs(secs.min(30)))
+
+    // Try parsing as delta-seconds (integer)
+    if let Ok(secs) = value.parse::<u64>() {
+        return Some(std::time::Duration::from_secs(secs.min(30)));
+    }
+
+    // Try parsing as HTTP-date format (e.g., "Fri, 24 Mar 2026 12:00:00 GMT")
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(value)
+        && let Ok(secs) = u64::try_from(dt.timestamp()) {
+            let target_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+            if let Ok(duration) = target_time.duration_since(std::time::SystemTime::now()) {
+                // Cap at 30s
+                return Some(duration.min(std::time::Duration::from_secs(30)));
+            }
+        }
+
+    None
 }
 
 pub struct HubApiClient {
@@ -279,6 +295,65 @@ fn make_clients() -> (Client, Client) {
     (client, head_client)
 }
 
+/// Helper to fetch with automatic retry on transient errors.
+/// Used during client initialization before HubApiClient instance exists.
+async fn fetch_with_retry(
+    client: &Client,
+    token: &Option<&str>,
+    token_file: &Option<PathBuf>,
+    url: &str,
+    context: &str,
+) -> Result<reqwest::Response> {
+    const MAX_RETRIES: u32 = 2;
+    let mut attempt = 0;
+
+    // Closure to read token from file, matching the logic in from_source.
+    let read_token_file = || -> Option<String> {
+        token_file
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+
+    loop {
+        attempt += 1;
+        let file_token = if token.is_none() { read_token_file() } else { None };
+        let effective_token = token.or(file_token.as_deref());
+
+        let req = match effective_token {
+            Some(t) => client.get(url).bearer_auth(t),
+            None => client.get(url),
+        };
+
+        let result = req.send().await;
+        match result {
+            Ok(resp) if resp.status().is_success() || resp.status().is_redirection() => {
+                return Ok(resp);
+            }
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                if is_retryable_status(status) && attempt < MAX_RETRIES {
+                    let delay = parse_retry_after(resp.headers()).unwrap_or_else(|| retry_delay(attempt));
+                    warn!("{context}: transient error ({status}), retry {attempt}/{MAX_RETRIES} in {delay:?}");
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                return Ok(resp);
+            }
+            Err(err) => {
+                if (err.is_timeout() || err.is_connect()) && attempt < MAX_RETRIES {
+                    let delay = retry_delay(attempt);
+                    warn!("{context}: transient error, retry {attempt}/{MAX_RETRIES} in {delay:?}: {err}");
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                return Err(Error::Http(err));
+            }
+        }
+    }
+}
+
 impl HubApiClient {
     /// Create a client from a `SourceKind` (bucket or repo).
     /// Create a client from a source kind. For repos, resolves aliases
@@ -293,25 +368,6 @@ impl HubApiClient {
         let (client, head_client) = make_clients();
         let endpoint = endpoint.trim_end_matches('/').to_string();
 
-        // Read token from file if no inline token was provided.
-        let file_token = if token.is_none() {
-            token_file
-                .as_ref()
-                .and_then(|p| std::fs::read_to_string(p).ok())
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-        } else {
-            None
-        };
-        let effective_token: Option<&str> = token.or(file_token.as_deref());
-
-        let auth = |req: reqwest::RequestBuilder| -> reqwest::RequestBuilder {
-            match effective_token {
-                Some(t) => req.bearer_auth(t),
-                None => req,
-            }
-        };
-
         let (source, last_modified) = match source {
             SourceKind::Repo {
                 repo_id,
@@ -319,7 +375,7 @@ impl HubApiClient {
                 revision,
             } => {
                 let url = format!("{}/api/{}/{}", endpoint, repo_type.api_prefix(), repo_id);
-                let resp = auth(client.get(&url)).send().await?;
+                let resp = fetch_with_retry(&client, &token, &token_file, &url, "repo metadata").await?;
                 if !resp.status().is_success() {
                     let status = resp.status().as_u16();
                     let body = resp.text().await.unwrap_or_default();
@@ -347,7 +403,7 @@ impl HubApiClient {
             }
             SourceKind::Bucket { bucket_id } => {
                 let url = format!("{}/api/buckets/{}", endpoint, bucket_id);
-                let resp = auth(client.get(&url)).send().await?;
+                let resp = fetch_with_retry(&client, &token, &token_file, &url, "bucket metadata").await?;
                 if !resp.status().is_success() {
                     let status = resp.status().as_u16();
                     return Err(Error::hub_status(status, format!("bucket not found: {bucket_id}")));
