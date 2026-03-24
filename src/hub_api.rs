@@ -211,13 +211,14 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::
 
     // Try parsing as HTTP-date format (e.g., "Fri, 24 Mar 2026 12:00:00 GMT")
     if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(value)
-        && let Ok(secs) = u64::try_from(dt.timestamp()) {
-            let target_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
-            if let Ok(duration) = target_time.duration_since(std::time::SystemTime::now()) {
-                // Cap at 30s
-                return Some(duration.min(std::time::Duration::from_secs(30)));
-            }
+        && let Ok(secs) = u64::try_from(dt.timestamp())
+    {
+        let target_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+        if let Ok(duration) = target_time.duration_since(std::time::SystemTime::now()) {
+            // Cap at 30s
+            return Some(duration.min(std::time::Duration::from_secs(30)));
         }
+    }
 
     None
 }
@@ -477,17 +478,20 @@ impl HubApiClient {
 
     /// Send an HTTP request with automatic retry on transient errors (429, 5xx, timeouts).
     /// Honors `Retry-After` headers when present, falls back to exponential backoff.
+    /// Set `accept_redirects` to treat 3xx as success (needed for HEAD on /resolve/ endpoints
+    /// where the redirect response itself carries metadata headers).
     async fn send_with_retry(
         &self,
         build_request: impl Fn() -> reqwest::RequestBuilder,
         context: &str,
+        accept_redirects: bool,
     ) -> Result<reqwest::Response> {
         const MAX_RETRIES: u32 = 2;
         let mut attempt = 0;
         loop {
             let result = build_request().send().await;
             let err = match result {
-                Ok(resp) if resp.status().is_success() || resp.status().is_redirection() => {
+                Ok(resp) if resp.status().is_success() || (accept_redirects && resp.status().is_redirection()) => {
                     return Ok(resp);
                 }
                 Ok(resp) => {
@@ -623,7 +627,7 @@ impl HubApiClient {
 
         loop {
             let resp = self
-                .send_with_retry(|| self.auth(self.client.get(&url)), "tree listing")
+                .send_with_retry(|| self.auth(self.client.get(&url)), "tree listing", false)
                 .await?;
 
             let next_url = resp
@@ -679,7 +683,7 @@ impl HubApiClient {
 
         loop {
             let resp = self
-                .send_with_retry(|| self.auth(self.client.get(&url)), "repo tree listing")
+                .send_with_retry(|| self.auth(self.client.get(&url)), "repo tree listing", false)
                 .await?;
 
             let next_url = resp
@@ -743,7 +747,7 @@ impl HubApiClient {
             }
         };
         let resp = self
-            .send_with_retry(|| self.auth(self.head_client.head(&url)), "head_file")
+            .send_with_retry(|| self.auth(self.head_client.head(&url)), "head_file", true)
             .await;
         let resp = match resp {
             Ok(r) => r,
@@ -800,7 +804,7 @@ impl HubApiClient {
         };
 
         let resp = self
-            .send_with_retry(|| self.auth(self.client.get(&url)), "CAS token request")
+            .send_with_retry(|| self.auth(self.client.get(&url)), "CAS token request", false)
             .await?;
         let info: CasTokenInfo = resp.json().await?;
         Ok(info)
@@ -817,7 +821,7 @@ impl HubApiClient {
         let url = format!("{}/api/buckets/{}/xet-write-token", self.endpoint, bucket_id);
 
         let resp = self
-            .send_with_retry(|| self.auth(self.client.get(&url)), "CAS write token request")
+            .send_with_retry(|| self.auth(self.client.get(&url)), "CAS write token request", false)
             .await?;
         let info: CasTokenInfo = resp.json().await?;
         Ok(info)
@@ -868,6 +872,7 @@ impl HubApiClient {
                     .body(body.clone())
             },
             "batch operation",
+            false,
         )
         .await?;
 
@@ -921,6 +926,7 @@ impl HubApiClient {
                     r
                 },
                 "HTTP download",
+                false,
             )
             .await;
         let resp = match resp {
