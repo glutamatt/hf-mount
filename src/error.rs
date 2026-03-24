@@ -29,7 +29,7 @@ impl Error {
     /// Whether this error is transient and the request should be retried.
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::Hub { status: Some(s), .. } => matches!(s, 429 | 500 | 502 | 503 | 504),
+            Self::Hub { status: Some(s), .. } => is_retryable_status(*s),
             Self::Http(err) => err.is_timeout() || err.is_connect(),
             _ => false,
         }
@@ -70,6 +70,10 @@ impl From<reqwest::Error> for Error {
     fn from(err: reqwest::Error) -> Self {
         Self::Http(err)
     }
+}
+
+pub fn is_retryable_status(status: u16) -> bool {
+    matches!(status, 429 | 500 | 502 | 503 | 504)
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

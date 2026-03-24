@@ -8,7 +8,7 @@ use tokio::io::AsyncWriteExt;
 use tracing::{info, warn};
 use xet_client::cas_client::auth::{AuthError, TokenInfo, TokenRefresher};
 
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, is_retryable_status};
 
 // ── HubOps trait ──────────────────────────────────────────────────────
 
@@ -190,10 +190,6 @@ pub struct CasTokenInfo {
 
 /// How often the token file is re-read from disk.
 const TOKEN_FILE_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
-
-fn is_retryable_status(status: u16) -> bool {
-    matches!(status, 429 | 500 | 502 | 503 | 504)
-}
 
 fn retry_delay(attempt: u32) -> std::time::Duration {
     std::time::Duration::from_millis(500 * 2u64.pow(attempt - 1))
