@@ -327,6 +327,21 @@ impl InodeTable {
         }
     }
 
+    /// Check whether a directory's children have been loaded from the Hub API.
+    pub fn is_children_loaded(&self, ino: u64) -> bool {
+        self.inodes.get(&ino).is_some_and(|e| e.children_loaded)
+    }
+
+    /// Return the full_path of every directory whose children have been loaded.
+    /// Used by the poll loop to only re-fetch directories the user has visited.
+    pub fn loaded_dir_prefixes(&self) -> Vec<String> {
+        self.inodes
+            .values()
+            .filter(|e| e.kind == InodeKind::Directory && e.children_loaded)
+            .map(|e| e.full_path.clone())
+            .collect()
+    }
+
     /// Get directory inode by path.
     pub fn get_dir_ino(&self, path: &str) -> Option<u64> {
         self.path_to_inode.get(path).copied().and_then(|ino| {
